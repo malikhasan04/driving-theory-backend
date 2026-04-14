@@ -6,6 +6,7 @@ import com.drivingtheory.dto.response.QuestionResponse;
 import com.drivingtheory.entity.PdfUpload;
 import com.drivingtheory.entity.Question;
 import com.drivingtheory.entity.User;
+import com.drivingtheory.enums.UploadStatus;
 import com.drivingtheory.exception.AppExceptions;
 import com.drivingtheory.repository.PdfUploadRepository;
 import com.drivingtheory.repository.QuestionRepository;
@@ -19,6 +20,8 @@ import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.multipart.MultipartFile;
 
+import java.time.LocalDateTime;
+
 @RestController
 @RequestMapping("/api/admin")
 @PreAuthorize("hasRole('ADMIN')")
@@ -29,38 +32,36 @@ public class AdminController {
     private final PdfUploadRepository   pdfUploadRepository;
     private final QuestionRepository    questionRepository;
 
-    /** Upload a PDF — returns immediately, extraction runs in background */
     @PostMapping("/upload-pdf")
     public ResponseEntity<ApiResponse<PdfUploadStatusResponse>> uploadPdf(
             @RequestParam("file") MultipartFile file,
             @AuthenticationPrincipal User admin) {
         PdfUpload upload = pdfExtractionService.initiateUpload(file, admin);
+        // Return a simple DTO — never return PdfUpload entity directly (Hibernate proxy issue)
         return ResponseEntity.accepted().body(ApiResponse.success(
                 "PDF received. Extraction running in background.",
-                new PdfUploadStatusResponse(
-                        upload.getId(), upload.getOriginalFilename(), upload.getStatus().name())));
+                toStatusResponse(upload)));
     }
 
-    /** Poll the status of a PDF upload job */
     @GetMapping("/upload-status/{uploadId}")
-    public ResponseEntity<ApiResponse<PdfUpload>> getUploadStatus(@PathVariable Long uploadId) {
+    public ResponseEntity<ApiResponse<PdfUploadStatusResponse>> getUploadStatus(
+            @PathVariable Long uploadId) {
         PdfUpload upload = pdfUploadRepository.findById(uploadId)
                 .orElseThrow(() -> new AppExceptions.ResourceNotFoundException(
                         "Upload not found: " + uploadId));
-        return ResponseEntity.ok(ApiResponse.success(upload));
+        return ResponseEntity.ok(ApiResponse.success(toStatusResponse(upload)));
     }
 
-    /** List all PDF uploads, newest first */
     @GetMapping("/uploads")
-    public ResponseEntity<ApiResponse<PageResponse<PdfUpload>>> listUploads(
+    public ResponseEntity<ApiResponse<PageResponse<PdfUploadStatusResponse>>> listUploads(
             @RequestParam(defaultValue = "0")  int page,
             @RequestParam(defaultValue = "10") int size) {
-        Page<PdfUpload> uploads = pdfUploadRepository
-                .findAllByOrderByCreatedAtDesc(PageRequest.of(page, size));
+        Page<PdfUploadStatusResponse> uploads = pdfUploadRepository
+                .findAllByOrderByCreatedAtDesc(PageRequest.of(page, size))
+                .map(this::toStatusResponse);
         return ResponseEntity.ok(ApiResponse.success(PageResponse.of(uploads)));
     }
 
-    /** List all active questions, paginated */
     @GetMapping("/questions")
     public ResponseEntity<ApiResponse<PageResponse<QuestionResponse>>> listQuestions(
             @RequestParam(defaultValue = "0")  int page,
@@ -76,7 +77,6 @@ public class AdminController {
         return ResponseEntity.ok(ApiResponse.success(PageResponse.of(mapped)));
     }
 
-    /** Soft-delete a question */
     @DeleteMapping("/questions/{id}")
     public ResponseEntity<ApiResponse<Void>> deactivateQuestion(@PathVariable Long id) {
         Question q = questionRepository.findById(id)
@@ -87,7 +87,6 @@ public class AdminController {
         return ResponseEntity.ok(ApiResponse.success("Question deactivated", null));
     }
 
-    /** Summary stats */
     @GetMapping("/stats")
     public ResponseEntity<ApiResponse<AdminStatsResponse>> getStats() {
         return ResponseEntity.ok(ApiResponse.success(new AdminStatsResponse(
@@ -95,6 +94,28 @@ public class AdminController {
                 questionRepository.countByActiveTrue())));
     }
 
-    public record PdfUploadStatusResponse(Long uploadId, String filename, String status) {}
+    // Convert entity to DTO — avoids Hibernate proxy serialization error
+    private PdfUploadStatusResponse toStatusResponse(PdfUpload u) {
+        return new PdfUploadStatusResponse(
+                u.getId(),
+                u.getOriginalFilename(),
+                u.getStatus().name(),
+                u.getQuestionsExtracted(),
+                u.getErrorMessage(),
+                u.getCreatedAt(),
+                u.getCompletedAt()
+        );
+    }
+
+    public record PdfUploadStatusResponse(
+            Long uploadId,
+            String filename,
+            String status,
+            int questionsExtracted,
+            String errorMessage,
+            LocalDateTime createdAt,
+            LocalDateTime completedAt
+    ) {}
+
     public record AdminStatsResponse(long totalQuestions, long activeQuestions) {}
 }

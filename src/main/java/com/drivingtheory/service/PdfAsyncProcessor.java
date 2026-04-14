@@ -104,7 +104,7 @@ public class PdfAsyncProcessor {
             stripper.setSortByPosition(true);
             String fullText = stripper.getText(doc);
 
-            log.debug("Extracted PDF text ({} chars)", fullText.length());
+            log.info("PDF text preview: {}", fullText.length() > 500 ? fullText.substring(0, 500) : fullText);
 
             List<BufferedImage> images = extractPageImages(doc);
             List<QuestionBlock> blocks = parseBlocks(fullText);
