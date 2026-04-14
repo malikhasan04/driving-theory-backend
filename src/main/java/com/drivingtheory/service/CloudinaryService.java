@@ -40,25 +40,17 @@ public class CloudinaryService {
         this.imageHeight = imageHeight;
     }
 
-    /**
-     * Uploads a BufferedImage extracted from a PDF to Cloudinary.
-     * Applies w_N,h_N,c_fit so road signs are stored at a consistent size.
-     */
     @SuppressWarnings("unchecked")
     public UploadResult uploadImage(BufferedImage image, String questionRef) throws IOException {
         byte[] bytes    = toBytes(image);
         String publicId = folder + "/" + questionRef + "_" + UUID.randomUUID().toString().substring(0, 8);
 
+        // Upload without transformation — let Cloudinary store the original
+        // Transformation via URL is more reliable than upload-time transformation
         Map<String, Object> result = cloudinary.uploader().upload(bytes, ObjectUtils.asMap(
-                "public_id",      publicId,
-                "folder",         folder,
-                "transformation", ObjectUtils.asMap(
-                        "width",        imageWidth,
-                        "height",       imageHeight,
-                        "crop",         "fit",
-                        "fetch_format", "auto",
-                        "quality",      "auto"),
-                "resource_type",  "image"));
+                "public_id",     publicId,
+                "resource_type", "image",
+                "overwrite",     true));
 
         String secureUrl        = (String) result.get("secure_url");
         String returnedPublicId = (String) result.get("public_id");
