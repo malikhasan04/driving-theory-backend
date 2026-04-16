@@ -11,18 +11,14 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.pdfbox.Loader;
 import org.apache.pdfbox.pdmodel.PDDocument;
-import org.apache.pdfbox.pdmodel.PDPage;
-import org.apache.pdfbox.pdmodel.graphics.image.PDImageXObject;
 import org.apache.pdfbox.text.PDFTextStripper;
 import org.springframework.cache.CacheManager;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
-import java.awt.image.BufferedImage;
 import java.io.IOException;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
-import java.util.List;
+import java.util.*;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -31,32 +27,34 @@ import java.util.regex.Pattern;
 @Slf4j
 public class PdfAsyncProcessor {
 
-    private final QuestionRepository    questionRepository;
-    private final PdfUploadRepository   pdfUploadRepository;
-    private final CloudinaryService     cloudinaryService;
-    private final CacheManager          cacheManager;
+    private final QuestionRepository  questionRepository;
+    private final PdfUploadRepository pdfUploadRepository;
+    private final CacheManager        cacheManager;
 
-    // Matches: "English: Some question text here"
-    private static final Pattern ENGLISH_LABEL = Pattern.compile(
+    // FORMAT 1 (TVDE_1.pdf): "1 - Question text" or "1- Question text"
+    private static final Pattern Q_NUM_DASH = Pattern.compile(
+            "^(\\d+)\\s*[-–]\\s*(.+)");
+
+    // FORMAT 2 (trilingual): "English: Question text"
+    private static final Pattern Q_ENGLISH = Pattern.compile(
             "^English:\\s*(.+)", Pattern.CASE_INSENSITIVE);
 
-    // Matches option lines like: "A Alert" or "A) Alert" or "A. Alert"
-    private static final Pattern OPTION_LINE = Pattern.compile(
-            "^([A-D])[.)\\s]\\s*(.+)");
+    // Options: "a) text", "b) text", "A) text", "B) text"
+    private static final Pattern OPTION_LOWER = Pattern.compile(
+            "^([a-dA-D])\\)\\s*(.+)");
 
-    // Matches correct answer markers:
-    // "✅ Correct Answer / جواب صحیح: A)" or "Correct Answer: A" or "Answer: A"
-    private static final Pattern ANSWER_MARKER = Pattern.compile(
-            "(?:Correct\\s*Answer|Answer|Ans)[^A-D]*([A-D])[).]?",
-            Pattern.CASE_INSENSITIVE);
-
-    // Matches option with checkmark: "A ✅ Alert" or "A ✅ Alerta Alert"
-    private static final Pattern OPTION_WITH_CHECK = Pattern.compile(
+    // Options with checkmark: "A ✅ text"
+    private static final Pattern OPTION_CHECK = Pattern.compile(
             "^([A-D])\\s*✅\\s*(.+)");
 
-    // Matches question number start: "1." or "1)" or "Portuguese: text"
-    private static final Pattern QUESTION_NUMBER = Pattern.compile(
-            "^(Portuguese:|\\d+[.):]\\s*.+)", Pattern.CASE_INSENSITIVE);
+    // Correct answer line: "✅ Correct Answer... A)" or "Answer: A"
+    private static final Pattern ANSWER_LINE = Pattern.compile(
+            "(?:Correct\\s*Answer|Answer|Ans)[^A-Da-d]*([A-Da-d])[).]?",
+            Pattern.CASE_INSENSITIVE);
+
+    // CORRIGENDA table row: "28 A 78 C 128 A 178 C" (multiple pairs per line)
+    private static final Pattern CORRIGENDA_PAIR = Pattern.compile(
+            "(\\d+)\\s+([A-Da-d])");
 
     @Async("pdfTaskExecutor")
     public void processAsync(Long uploadId, byte[] pdfBytes) {
@@ -68,9 +66,7 @@ public class PdfAsyncProcessor {
 
             if (questions.isEmpty()) {
                 upload.setStatus(UploadStatus.FAILED);
-                upload.setErrorMessage(
-                        "No questions could be extracted. Please check the PDF format. " +
-                                "The PDF should contain questions with English text, options A/B/C/D, and correct answers marked with ✅ or 'Answer: X'.");
+                upload.setErrorMessage("No questions could be extracted. Please check the PDF format.");
                 upload.setCompletedAt(LocalDateTime.now());
                 pdfUploadRepository.save(upload);
                 return;
@@ -95,126 +91,189 @@ public class PdfAsyncProcessor {
         }
     }
 
-    // ── Extraction ───────────────────────────────────────────────────────────
-
     private List<Question> extractQuestions(byte[] pdfBytes) throws IOException {
-        List<Question> questions = new ArrayList<>();
         try (PDDocument doc = Loader.loadPDF(pdfBytes)) {
             PDFTextStripper stripper = new PDFTextStripper();
             stripper.setSortByPosition(true);
             String fullText = stripper.getText(doc);
 
-            log.info("PDF text preview: {}", fullText.length() > 500 ? fullText.substring(0, 500) : fullText);
+            log.info("PDF text preview (first 400 chars): {}",
+                    fullText.length() > 400 ? fullText.substring(0, 400) : fullText);
 
-            List<BufferedImage> images = extractPageImages(doc);
-            List<QuestionBlock> blocks = parseBlocks(fullText);
+            // Detect format based on content
+            boolean isPortugueseFormat = fullText.contains("CORRIGENDA") ||
+                    Pattern.compile("^\\d+\\s*[-–]\\s*", Pattern.MULTILINE).matcher(fullText).find();
+            boolean isTrilingualFormat = fullText.contains("English:") && fullText.contains("✅");
 
-            log.info("Parsed {} question blocks from PDF", blocks.size());
-
-            for (int i = 0; i < blocks.size(); i++) {
-                Question q = buildQuestion(blocks.get(i));
-                // Try to attach image if available
-                if (i < images.size()) {
-                    try {
-                        CloudinaryService.UploadResult r =
-                                cloudinaryService.uploadImage(images.get(i), "q" + (i + 1));
-                        q.setImageUrl(r.secureUrl());
-                        q.setImagePublicId(r.publicId());
-                    } catch (IOException e) {
-                        log.warn("Could not upload image for question {}: {}", i + 1, e.getMessage());
-                    }
-                }
-                questions.add(q);
+            List<Question> questions;
+            if (isPortugueseFormat && !isTrilingualFormat) {
+                log.info("Detected Portuguese numbered format (with CORRIGENDA)");
+                questions = parsePortugueseFormat(fullText);
+            } else if (isTrilingualFormat) {
+                log.info("Detected trilingual format (Portuguese/English/Urdu with checkmarks)");
+                questions = parseTrilingualFormat(fullText);
+            } else {
+                log.info("Detected simple numbered format");
+                questions = parseSimpleFormat(fullText);
             }
+
+            log.info("Parsed {} questions total", questions.size());
+            return questions;
         }
-        return questions;
     }
 
-    private List<BufferedImage> extractPageImages(PDDocument doc) {
-        List<BufferedImage> images = new ArrayList<>();
-        for (PDPage page : doc.getPages()) {
-            try {
-                var resources = page.getResources();
-                if (resources == null) continue;
-                for (var name : resources.getXObjectNames()) {
-                    var xObj = resources.getXObject(name);
-                    if (xObj instanceof PDImageXObject imgXObj) {
-                        BufferedImage img = imgXObj.getImage();
-                        // Skip very small images (icons, logos)
-                        if (img.getWidth() > 50 && img.getHeight() > 50) {
-                            images.add(img);
-                        }
-                    }
-                }
-            } catch (IOException e) {
-                log.warn("Could not extract image from page: {}", e.getMessage());
-            }
-        }
-        return images;
-    }
+    // ── FORMAT 1: Portuguese numbered with CORRIGENDA answer key ──────────────
 
-    /**
-     * Supports two PDF formats:
-     *
-     * FORMAT 1 (trilingual with ✅):
-     *   Portuguese: Question in Portuguese
-     *   English: Question in English
-     *   Urdu: Question in Urdu
-     *   Option  Portuguese  English  Urdu
-     *   A ✅    Alerta      Alert    ارلٹ
-     *   B       Reconhecimento  Recognition  شناخت
-     *   ✅ Correct Answer / جواب صحیح: A)
-     *
-     * FORMAT 2 (simple):
-     *   1. What does a red traffic light mean?
-     *   A) Stop completely
-     *   B) Slow down
-     *   C) Proceed with caution
-     *   D) Turn left only
-     *   Answer: A
-     *   Explanation: optional
-     */
-    private List<QuestionBlock> parseBlocks(String text) {
-        List<QuestionBlock> blocks  = new ArrayList<>();
-        String[]            lines   = text.split("\\r?\\n");
-        QuestionBlock       current = null;
+    private List<Question> parsePortugueseFormat(String text) {
+        String[] lines = text.split("\\r?\\n");
+
+        // Step 1: Extract CORRIGENDA answer key  (question# -> correct letter)
+        Map<Integer, String> answerKey = extractCorrigenda(lines);
+        log.info("Extracted {} answers from CORRIGENDA", answerKey.size());
+
+        // Step 2: Parse questions and options
+        List<QuestionBlock> blocks = new ArrayList<>();
+        QuestionBlock current = null;
 
         for (int i = 0; i < lines.length; i++) {
             String line = lines[i].trim();
             if (line.isEmpty()) continue;
 
-            // ── Detect correct answer from ✅ Correct Answer line ──
-            if (line.contains("Correct Answer") || line.contains("جواب صحیح")) {
-                if (current != null) {
-                    Matcher am = ANSWER_MARKER.matcher(line);
-                    if (am.find()) {
-                        current.correctOption = am.group(1).toUpperCase();
-                    }
+            // Stop parsing questions when we hit the answer key section
+            if (line.contains("CORRIGENDA") || line.contains("NR") && line.contains("Pergunta") && line.contains("Resposta")) {
+                break;
+            }
+
+            // Match question: "1 - Question text" or "1- Question text"
+            Matcher qm = Q_NUM_DASH.matcher(line);
+            if (qm.matches()) {
+                if (current != null && current.hasMinimumData()) {
+                    blocks.add(current);
+                }
+                current = new QuestionBlock();
+                current.questionNum = Integer.parseInt(qm.group(1));
+                current.questionText = qm.group(2).trim();
+                continue;
+            }
+
+            if (current == null) continue;
+
+            // Accumulate multi-line question text (before first option)
+            // Match options: "a) text", "b) text"
+            Matcher om = OPTION_LOWER.matcher(line);
+            if (om.matches()) {
+                String letter = om.group(1).toUpperCase();
+                String value  = om.group(2).trim();
+                // Skip header-like lines
+                if (!value.isBlank()) {
+                    setOption(current, letter, value);
                 }
                 continue;
             }
 
-            // ── Detect simple "Answer: A" line ──
-            Matcher am = ANSWER_MARKER.matcher(line);
+            // Multi-line question text (before any option is set)
+            if (current.optionA == null && !line.matches("^Pág\\..*") && !line.contains("CMTVDE")) {
+                current.questionText = current.questionText + " " + line;
+            }
+
+            // Multi-line option text
+            if (current.optionA != null && !line.matches("^[a-dA-D]\\).*") && !line.matches("^\\d+\\s*[-–].*")) {
+                // append to last set option
+                if (current.optionD != null) current.optionD += " " + line;
+                else if (current.optionC != null) current.optionC += " " + line;
+                else if (current.optionB != null) current.optionB += " " + line;
+                else if (current.optionA != null) current.optionA += " " + line;
+            }
+        }
+
+        // Flush last block
+        if (current != null && current.hasMinimumData()) {
+            blocks.add(current);
+        }
+
+        // Step 3: Build questions merging with answer key
+        List<Question> questions = new ArrayList<>();
+        for (QuestionBlock b : blocks) {
+            fillMissingOptions(b);
+            // Get answer from CORRIGENDA
+            if (b.questionNum != null && answerKey.containsKey(b.questionNum)) {
+                b.correctOption = answerKey.get(b.questionNum).toUpperCase();
+            } else {
+                b.correctOption = "A"; // fallback
+            }
+            questions.add(buildQuestion(b));
+        }
+        return questions;
+    }
+
+    /**
+     * Parse CORRIGENDA section which looks like:
+     * "1 C 51 B 101 C 151 A 201 A"
+     * "2 C 52 C 102 A 152 D 202 A"
+     */
+    private Map<Integer, String> extractCorrigenda(String[] lines) {
+        Map<Integer, String> map = new HashMap<>();
+        boolean inCorrigenda = false;
+
+        for (String rawLine : lines) {
+            String line = rawLine.trim();
+
+            if (line.contains("CORRIGENDA")) {
+                inCorrigenda = true;
+                continue;
+            }
+
+            if (!inCorrigenda) continue;
+
+            // Each line can have multiple "number letter" pairs
+            Matcher m = CORRIGENDA_PAIR.matcher(line);
+            while (m.find()) {
+                int num = Integer.parseInt(m.group(1));
+                String letter = m.group(2);
+                // Only store if looks like a valid question number (1-300)
+                if (num >= 1 && num <= 300) {
+                    map.put(num, letter);
+                }
+            }
+        }
+        return map;
+    }
+
+    // ── FORMAT 2: Trilingual Portuguese/English/Urdu with ✅ ──────────────────
+
+    private List<Question> parseTrilingualFormat(String text) {
+        List<QuestionBlock> blocks = new ArrayList<>();
+        String[]            lines  = text.split("\\r?\\n");
+        QuestionBlock       current = null;
+
+        for (String rawLine : lines) {
+            String line = rawLine.trim();
+            if (line.isEmpty()) continue;
+
+            if (line.contains("Correct Answer") || line.contains("جواب صحیح")) {
+                if (current != null) {
+                    Matcher am = ANSWER_LINE.matcher(line);
+                    if (am.find()) current.correctOption = am.group(1).toUpperCase();
+                }
+                continue;
+            }
+
+            Matcher am = ANSWER_LINE.matcher(line);
             if (am.find() && !line.toLowerCase().startsWith("option") && current != null) {
                 current.correctOption = am.group(1).toUpperCase();
                 continue;
             }
 
-            // ── Detect option line with checkmark: "A ✅ Text" ──
-            Matcher ocm = OPTION_WITH_CHECK.matcher(line);
+            Matcher ocm = OPTION_CHECK.matcher(line);
             if (ocm.matches() && current != null) {
                 String letter = ocm.group(1).toUpperCase();
-                // Extract English text — take text after ✅, ignore Urdu/Arabic
-                String value = extractEnglishPart(ocm.group(2));
+                String value  = extractEnglishPart(ocm.group(2));
                 setOption(current, letter, value);
-                // This option is correct
                 current.correctOption = letter;
                 continue;
             }
 
-            // ── Detect regular option line: "A) Text" or "A Text" ──
-            Matcher om = OPTION_LINE.matcher(line);
+            Matcher om = OPTION_LOWER.matcher(line);
             if (om.matches() && current != null) {
                 String letter = om.group(1).toUpperCase();
                 String value  = extractEnglishPart(om.group(2));
@@ -226,10 +285,8 @@ public class PdfAsyncProcessor {
                 continue;
             }
 
-            // ── Detect English question line: "English: Question text" ──
-            Matcher em = ENGLISH_LABEL.matcher(line);
+            Matcher em = Q_ENGLISH.matcher(line);
             if (em.matches()) {
-                // Save previous block
                 if (current != null && current.hasMinimumData()) {
                     fillMissingOptions(current);
                     blocks.add(current);
@@ -239,80 +296,105 @@ public class PdfAsyncProcessor {
                 continue;
             }
 
-            // ── Detect numbered question: "1. Question text" ──
+            if (current != null && current.optionA == null
+                    && !line.toLowerCase().startsWith("portuguese:")
+                    && !line.toLowerCase().startsWith("option")
+                    && !containsOnlyUrdu(line)) {
+                current.questionText = (current.questionText == null ? "" :
+                        current.questionText + " ") + line;
+            }
+        }
+
+        if (current != null && current.hasMinimumData()) {
+            fillMissingOptions(current);
+            blocks.add(current);
+        }
+
+        List<Question> questions = new ArrayList<>();
+        for (QuestionBlock b : blocks) {
+            if (b.correctOption == null) b.correctOption = "A";
+            questions.add(buildQuestion(b));
+        }
+        return questions;
+    }
+
+    // ── FORMAT 3: Simple numbered "1. Question / A) Option / Answer: A" ───────
+
+    private List<Question> parseSimpleFormat(String text) {
+        List<QuestionBlock> blocks = new ArrayList<>();
+        String[]            lines  = text.split("\\r?\\n");
+        QuestionBlock       current = null;
+
+        for (String line : lines) {
+            line = line.trim();
+            if (line.isEmpty()) continue;
+
             if (line.matches("^\\d+[.):] .+")) {
                 if (current != null && current.hasMinimumData()) {
                     fillMissingOptions(current);
                     blocks.add(current);
                 }
                 current = new QuestionBlock();
-                // Remove the number prefix
                 current.questionText = line.replaceFirst("^\\d+[.):] ", "").trim();
                 continue;
             }
 
-            // ── Explanation ──
-            if (line.toLowerCase().startsWith("explanation:") && current != null) {
-                current.explanation = line.substring("explanation:".length()).trim();
+            if (current == null) continue;
+
+            Matcher am = ANSWER_LINE.matcher(line);
+            if (am.find()) { current.correctOption = am.group(1).toUpperCase(); continue; }
+
+            Matcher om = OPTION_LOWER.matcher(line);
+            if (om.matches()) {
+                setOption(current, om.group(1).toUpperCase(), om.group(2).trim());
                 continue;
             }
 
-            // ── Multi-line question text accumulation ──
-            if (current != null && current.optionA == null
-                    && !line.toLowerCase().startsWith("portuguese:")
-                    && !line.toLowerCase().startsWith("option")
-                    && !containsOnlyUrdu(line)) {
-                current.questionText = (current.questionText == null ? "" : current.questionText + " ") + line;
+            if (line.toLowerCase().startsWith("explanation:")) {
+                current.explanation = line.substring("explanation:".length()).trim();
             }
         }
 
-        // Flush last block
         if (current != null && current.hasMinimumData()) {
             fillMissingOptions(current);
             blocks.add(current);
         }
 
-        return blocks;
+        List<Question> questions = new ArrayList<>();
+        for (QuestionBlock b : blocks) {
+            if (b.correctOption == null) b.correctOption = "A";
+            questions.add(buildQuestion(b));
+        }
+        return questions;
     }
 
-    /**
-     * Extract the English portion from a mixed-language string.
-     * The string typically has English text followed by Urdu/Arabic script.
-     * We keep text up to the first Arabic/Urdu character.
-     */
+    // ── Helpers ───────────────────────────────────────────────────────────────
+
     private String extractEnglishPart(String text) {
         if (text == null) return "";
-        // Find first Arabic/Urdu character (Unicode range 0600-06FF, 0750-077F, FB50-FDFF, FE70-FEFF)
         StringBuilder sb = new StringBuilder();
         for (char c : text.toCharArray()) {
-            if (Character.UnicodeBlock.of(c) == Character.UnicodeBlock.ARABIC
-                    || Character.UnicodeBlock.of(c) == Character.UnicodeBlock.ARABIC_SUPPLEMENT
-                    || Character.UnicodeBlock.of(c) == Character.UnicodeBlock.ARABIC_PRESENTATION_FORMS_A
-                    || Character.UnicodeBlock.of(c) == Character.UnicodeBlock.ARABIC_PRESENTATION_FORMS_B) {
+            Character.UnicodeBlock block = Character.UnicodeBlock.of(c);
+            if (block == Character.UnicodeBlock.ARABIC
+                    || block == Character.UnicodeBlock.ARABIC_SUPPLEMENT
+                    || block == Character.UnicodeBlock.ARABIC_PRESENTATION_FORMS_A
+                    || block == Character.UnicodeBlock.ARABIC_PRESENTATION_FORMS_B) {
                 break;
             }
             sb.append(c);
         }
-        return sb.toString().trim()
-                .replaceAll("✅", "")
-                .replaceAll("\\s+", " ")
-                .trim();
+        return sb.toString().replaceAll("✅", "").replaceAll("\\s+", " ").trim();
     }
 
-    /**
-     * Check if a line contains mostly Urdu/Arabic characters.
-     */
     private boolean containsOnlyUrdu(String line) {
         if (line == null || line.isBlank()) return false;
-        long arabicChars = line.chars()
-                .filter(c -> {
-                    Character.UnicodeBlock block = Character.UnicodeBlock.of(c);
-                    return block == Character.UnicodeBlock.ARABIC
-                            || block == Character.UnicodeBlock.ARABIC_SUPPLEMENT
-                            || block == Character.UnicodeBlock.ARABIC_PRESENTATION_FORMS_A
-                            || block == Character.UnicodeBlock.ARABIC_PRESENTATION_FORMS_B;
-                })
-                .count();
+        long arabicChars = line.chars().filter(c -> {
+            Character.UnicodeBlock b = Character.UnicodeBlock.of(c);
+            return b == Character.UnicodeBlock.ARABIC
+                    || b == Character.UnicodeBlock.ARABIC_SUPPLEMENT
+                    || b == Character.UnicodeBlock.ARABIC_PRESENTATION_FORMS_A
+                    || b == Character.UnicodeBlock.ARABIC_PRESENTATION_FORMS_B;
+        }).count();
         return arabicChars > line.length() * 0.3;
     }
 
@@ -326,22 +408,16 @@ public class PdfAsyncProcessor {
         }
     }
 
-    /**
-     * Fill missing options with placeholder text so questions with only 2 or 3
-     * options can still be saved (DB columns are NOT NULL).
-     */
     private void fillMissingOptions(QuestionBlock b) {
         if (b.optionA == null) b.optionA = "N/A";
         if (b.optionB == null) b.optionB = "N/A";
         if (b.optionC == null) b.optionC = "N/A";
         if (b.optionD == null) b.optionD = "N/A";
-        // Default correct answer if not found
-        if (b.correctOption == null) b.correctOption = "A";
     }
 
     private Question buildQuestion(QuestionBlock b) {
         return Question.builder()
-                .questionText(b.questionText)
+                .questionText(b.questionText != null ? b.questionText.trim() : "")
                 .optionA(b.optionA)
                 .optionB(b.optionB)
                 .optionC(b.optionC)
@@ -354,21 +430,16 @@ public class PdfAsyncProcessor {
 
     private void evictQuestionBankCache() {
         var cache = cacheManager.getCache(RedisConfig.CACHE_QUESTION_BANK);
-        if (cache != null) {
-            cache.clear();
-            log.info("Evicted question-bank cache after PDF ingestion");
-        }
+        if (cache != null) cache.clear();
     }
 
-    // ── Inner parsing state ──────────────────────────────────────────────────
-
     private static class QuestionBlock {
-        String questionText;
-        String optionA, optionB, optionC, optionD;
-        String correctOption;
-        String explanation;
+        Integer questionNum;
+        String  questionText;
+        String  optionA, optionB, optionC, optionD;
+        String  correctOption;
+        String  explanation;
 
-        /** Requires at least a question and 2 options. */
         boolean hasMinimumData() {
             return questionText != null && !questionText.isBlank()
                     && optionA != null && optionB != null;
