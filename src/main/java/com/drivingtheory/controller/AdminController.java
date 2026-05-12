@@ -1,17 +1,18 @@
 package com.drivingtheory.controller;
 
+import com.drivingtheory.config.RedisConfig;
 import com.drivingtheory.dto.response.ApiResponse;
 import com.drivingtheory.dto.response.PageResponse;
 import com.drivingtheory.dto.response.QuestionResponse;
 import com.drivingtheory.entity.PdfUpload;
 import com.drivingtheory.entity.Question;
 import com.drivingtheory.entity.User;
-import com.drivingtheory.enums.UploadStatus;
 import com.drivingtheory.exception.AppExceptions;
 import com.drivingtheory.repository.PdfUploadRepository;
 import com.drivingtheory.repository.QuestionRepository;
 import com.drivingtheory.service.PdfExtractionService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.cache.CacheManager;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageRequest;
 import org.springframework.http.ResponseEntity;
@@ -31,13 +32,13 @@ public class AdminController {
     private final PdfExtractionService  pdfExtractionService;
     private final PdfUploadRepository   pdfUploadRepository;
     private final QuestionRepository    questionRepository;
+    private final CacheManager          cacheManager;
 
     @PostMapping("/upload-pdf")
     public ResponseEntity<ApiResponse<PdfUploadStatusResponse>> uploadPdf(
             @RequestParam("file") MultipartFile file,
             @AuthenticationPrincipal User admin) {
         PdfUpload upload = pdfExtractionService.initiateUpload(file, admin);
-        // Return a simple DTO — never return PdfUpload entity directly (Hibernate proxy issue)
         return ResponseEntity.accepted().body(ApiResponse.success(
                 "PDF received. Extraction running in background.",
                 toStatusResponse(upload)));
@@ -60,6 +61,23 @@ public class AdminController {
                 .findAllByOrderByCreatedAtDesc(PageRequest.of(page, size))
                 .map(this::toStatusResponse);
         return ResponseEntity.ok(ApiResponse.success(PageResponse.of(uploads)));
+    }
+
+    @DeleteMapping("/uploads/{uploadId}")
+    public ResponseEntity<ApiResponse<Void>> deleteUpload(@PathVariable Long uploadId) {
+        PdfUpload upload = pdfUploadRepository.findById(uploadId)
+                .orElseThrow(() -> new AppExceptions.ResourceNotFoundException(
+                        "Upload not found: " + uploadId));
+        pdfUploadRepository.delete(upload);
+        return ResponseEntity.ok(ApiResponse.success("Upload record deleted", null));
+    }
+
+    @DeleteMapping("/questions/all")
+    public ResponseEntity<ApiResponse<Void>> deleteAllQuestions() {
+        questionRepository.deleteAll();
+        evictCache();
+        return ResponseEntity.ok(ApiResponse.success(
+                "All questions deleted. You can now upload a new PDF.", null));
     }
 
     @GetMapping("/questions")
@@ -94,7 +112,11 @@ public class AdminController {
                 questionRepository.countByActiveTrue())));
     }
 
-    // Convert entity to DTO — avoids Hibernate proxy serialization error
+    private void evictCache() {
+        var cache = cacheManager.getCache(RedisConfig.CACHE_QUESTION_BANK);
+        if (cache != null) cache.clear();
+    }
+
     private PdfUploadStatusResponse toStatusResponse(PdfUpload u) {
         return new PdfUploadStatusResponse(
                 u.getId(),
